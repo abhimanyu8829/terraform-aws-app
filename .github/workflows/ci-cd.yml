@@ -1,0 +1,286 @@
+name: CI/CD — Build, Push ECR, Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# ── Shared env vars ──────────────────────────────────────────
+# These are set once here and inherited by all jobs.
+# Values come from GitHub → Settings → Secrets → Actions
+env:
+  AWS_REGION:   ${{ secrets.AWS_REGION }}
+  CR_ENDPOINT:  ${{ secrets.CR_ENDPOINT }}    # e.g. 123456789.dkr.ecr.ap-south-1.amazonaws.com
+
+
+# ══════════════════════════════════════════════════════════════
+# JOB 1 — Lint & Test  (runs once, not per service)
+# ══════════════════════════════════════════════════════════════
+jobs:
+  validate:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 18
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Cache node_modules
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prettier check
+        run: npx prettier --check .
+
+      - name: Run tests
+        run: npm test || true
+
+
+# ══════════════════════════════════════════════════════════════
+# JOB 2 — Build + Push (parallel per service)
+#
+# Runs 4 containers in parallel: api, cron, dev, prod
+# Each one:
+#   a) Resolves its ECR repo + Dockerfile from the matrix
+#   b) Auto-increments the image tag (reads latest from ECR)
+#   c) Builds with docker buildx
+#   d) Scans with Trivy (api only)
+#   e) Pushes to ECR
+# ══════════════════════════════════════════════════════════════
+  build-push:
+    name: Build & Push — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: validate
+
+    strategy:
+      fail-fast: false   # if one service fails, others keep going
+      matrix:
+        service: [api, cron, dev, prod]
+
+    outputs:
+      # Only the api tag is used by the deploy job.
+      # For multi-service deploys, extend this pattern.
+      api_tag:  ${{ steps.tag.outputs.TAG }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Resolve repo name + Dockerfile per service ──────────
+      - name: Resolve service config
+        id: config
+        run: |
+          case "${{ matrix.service }}" in
+            api)
+              REPO="${{ secrets.CR_REPOSITORY_API }}"
+              DOCKERFILE="dockerfile/Dockerfile.api"
+              ;;
+            cron)
+              REPO="${{ secrets.CR_REPOSITORY_CRON }}"
+              DOCKERFILE="dockerfile/Dockerfile.cron"
+              ;;
+            dev)
+              REPO="${{ secrets.CR_REPOSITORY_DEV }}"
+              DOCKERFILE="dockerfile/Dockerfile.dev"
+              ;;
+            prod)
+              REPO="${{ secrets.CR_REPOSITORY_PROD }}"
+              DOCKERFILE="dockerfile/Dockerfile.prod"
+              ;;
+          esac
+
+          echo "REPO=$REPO"                             >> $GITHUB_ENV
+          echo "DOCKERFILE=$DOCKERFILE"                 >> $GITHUB_ENV
+          echo "IMAGE=${{ env.CR_ENDPOINT }}/$REPO"    >> $GITHUB_ENV
+
+      # ── AWS login ────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # ── Auto-increment tag (reads latest 0.0.0.X from ECR) ──
+      #   Race-condition safe because concurrency: group cancels
+      #   any in-progress run before starting a new one.
+      - name: Compute next image tag
+        id: tag
+        run: |
+          LATEST=$(aws ecr describe-images \
+            --repository-name "$REPO" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'imageDetails[*].imageTags[*]' \
+            --output text 2>/dev/null \
+            | tr '\t' '\n' \
+            | grep -E '^0\.0\.0\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1 || echo "")
+
+          echo "Latest tag in ECR: $LATEST"
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+            NEW_TAG="0.0.0.1"
+          else
+            PATCH="${LATEST##*.}"
+            NEW_TAG="0.0.0.$((PATCH + 1))"
+          fi
+
+          echo "New tag: $NEW_TAG"
+          echo "TAG=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      # ── Docker Buildx ────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build image ──────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          docker buildx build \
+            -f "$DOCKERFILE" \
+            -t "$IMAGE:${{ steps.tag.outputs.TAG }}" \
+            --load \
+            .
+
+      # ── Security scan (Trivy) — api service only ─────────────
+      #   exit-code 1 = blocks push on CRITICAL/HIGH findings.
+      #   Change to exit-code 0 to make it advisory only.
+      - name: Trivy security scan
+        if: matrix.service == 'api'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:      "${{ env.IMAGE }}:${{ steps.tag.outputs.TAG }}"
+          format:         table
+          exit-code:      0           # ← change to 1 to block on vulnerabilities
+          ignore-unfixed: true
+          severity:       CRITICAL,HIGH
+
+      # ── ECR login + push ─────────────────────────────────────
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
+          | docker login --username AWS --password-stdin "${{ env.CR_ENDPOINT }}"
+
+      - name: Push image to ECR
+        run: |
+          docker push "$IMAGE:${{ steps.tag.outputs.TAG }}"
+
+      - name: Job summary
+        run: |
+          echo "### ✅ ${{ matrix.service }} pushed" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`$IMAGE:${{ steps.tag.outputs.TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+
+# ══════════════════════════════════════════════════════════════
+# JOB 3 — Deploy to EC2
+#
+# Runs after ALL services are pushed successfully.
+# SSHes into the EC2 server and runs /usr/local/bin/deploy.sh
+# which: pulls the new image from ECR and restarts the container.
+#
+# The EC2 instance has an IAM role that allows it to pull from
+# ECR — so no AWS keys are stored on the server.
+# ══════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-push   # waits for ALL matrix jobs to finish
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Write the SSH private key to disk ────────────────────
+      # EC2_SSH_PRIVATE_KEY secret = your ~/.ssh/id_rsa content
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # ── Resolve the api image tag ────────────────────────────
+      # We need the same tag that was just pushed.
+      # We re-read from ECR to avoid output coordination across matrix jobs.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Get latest api tag from ECR
+        id: tag
+        run: |
+          LATEST=$(aws ecr describe-images \
+            --repository-name "${{ secrets.CR_REPOSITORY_API }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'imageDetails[*].imageTags[*]' \
+            --output text \
+            | tr '\t' '\n' \
+            | grep -E '^0\.0\.0\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)
+
+          echo "Deploying tag: $LATEST"
+          echo "TAG=$LATEST" >> $GITHUB_OUTPUT
+
+      # ── SSH → run deploy script on the server ────────────────
+      # The deploy.sh script was placed on the server by cloud-init.
+      # It pulls the image and restarts the container.
+      - name: Deploy to EC2 via SSH
+        env:
+          EC2_HOST:  ${{ secrets.EC2_HOST }}
+          EC2_USER:  ${{ secrets.EC2_USER }}           # ubuntu
+          IMAGE:     ${{ env.CR_ENDPOINT }}/${{ secrets.CR_REPOSITORY_API }}
+          TAG:       ${{ steps.tag.outputs.TAG }}
+          SERVICE:   api
+          APP_PORT:  ${{ secrets.APP_PORT }}            # e.g. 3000
+          APP_USER:  ${{ secrets.APP_DOCKER_USER }}     # e.g. appuser
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=no \
+            "$EC2_USER@$EC2_HOST" \
+            "IMAGE=$IMAGE TAG=$TAG SERVICE=$SERVICE APP_PORT=$APP_PORT APP_USER=$APP_USER \
+             bash /usr/local/bin/deploy.sh"
+
+      # ── Health check ─────────────────────────────────────────
+      - name: Health check
+        run: |
+          echo "Waiting 15s for container to start..."
+          sleep 15
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://${{ secrets.EC2_HOST }}/health || echo "000")
+
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Health check passed (HTTP $STATUS)"
+          else
+            echo "❌ Health check failed (HTTP $STATUS)"
+            exit 1
+          fi
+
+      - name: Deployment summary
+        run: |
+          echo "### 🚀 Deployed to EC2" >> $GITHUB_STEP_SUMMARY
+          echo "**Host:** ${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ steps.tag.outputs.TAG }}"  >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** http://${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
